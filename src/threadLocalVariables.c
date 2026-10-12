@@ -486,9 +486,8 @@ void tlv_initializer()
 
 
 // linked images with TLV have references to this symbol, but it is never used at runtime
-void _tlv_bootstrap()
+void _tlv_bootstrap(void)
 {
-	abort();
 }
 
 
