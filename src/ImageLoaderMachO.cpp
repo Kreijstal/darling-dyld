@@ -68,6 +68,9 @@ extern "C" void __simple_kprintf(const char* format, ...);
 
 // <rdar://problem/8718137> use stack guard random value to add padding between dylibs
 extern "C" long __stack_chk_guard;
+#if defined(__aarch64__) || defined(__arm64__)
+extern "C" unsigned long sys_thread_get_native_tsd_slot_offset(void);
+#endif
 
 #define LIBSYSTEM_DYLIB_PATH 		  	  "/usr/lib/libSystem.B.dylib"
 #define LIBDYLD_DYLIB_PATH 		  	  "/usr/lib/system/libdyld.dylib"
@@ -2740,6 +2743,10 @@ void ImageLoaderMachO::mapSegments(int fd, uint64_t offsetInFat, uint64_t lenInF
 #if defined(__aarch64__) || defined(__arm64__)
 			if ( (protection & PROT_EXEC) && loadAddress != MAP_FAILED && size > 0 ) {
 				if (mprotect(loadAddress, size, PROT_READ | PROT_WRITE) == 0) {
+					// The loader's own TLS slot holds the TSD base; [tp, #64] only for loaders that don't name one.
+					unsigned long slot = sys_thread_get_native_tsd_slot_offset();
+					if (slot < 16 || slot > 32760 || (slot & 7))
+						slot = 64;
 					uint32_t* insns = (uint32_t*) loadAddress;
 					size_t count = size / sizeof(uint32_t);
 					for (size_t k = 0; k < count; k++) {
@@ -2748,7 +2755,7 @@ void ImageLoaderMachO::mapSegments(int fd, uint64_t offsetInFat, uint64_t lenInF
 							insns[k] = 0xD53BD040U | rt; // mrs Xt, TPIDR_EL0
 							if (k + 1 < count && ((insns[k+1] & 0xFFC00000U) == 0x92400000U) &&
 							    ((insns[k+1] & 0x1FU) == rt) && (((insns[k+1] >> 5) & 0x1FU) == rt)) {
-								insns[k+1] = 0xF9402000U | (rt << 5) | rt; // ldr Xt, [Xt, #64]
+								insns[k+1] = 0xF9400000U | ((uint32_t)(slot / 8) << 10) | (rt << 5) | rt; // ldr Xt, [Xt, #slot]
 								k++;
 							}
 						}
