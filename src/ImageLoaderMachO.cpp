@@ -66,6 +66,8 @@ extern "C" {
 #include "dyld2.h"
 #if defined(DARLING) && (defined(__aarch64__) || defined(__arm64__))
 #include "DarlingDylibArena.h"
+#include "DarlingTSDImage.h"
+extern "C" unsigned long sys_thread_get_native_tsd_slot_offset(void);
 #endif
 
 // <rdar://problem/8718137> use stack guard random value to add padding between dylibs
@@ -93,6 +95,37 @@ extern "C" long __stack_chk_guard;
 	struct macho_segment_command	: public segment_command {};
 	struct macho_section			: public section  {};	
 	struct macho_routines_command	: public routines_command  {};	
+#endif
+
+#if defined(DARLING) && (defined(__aarch64__) || defined(__arm64__))
+static void darlingRewriteMappedTSD(const macho_segment_command* segment,
+    size_t commandBytes, uintptr_t address, size_t bytes, int protection)
+{
+    if ((protection & PROT_EXEC) == 0) return;
+    const uintptr_t slot = sys_thread_get_native_tsd_slot_offset();
+    if (!DarlingTSDImage::protectionRangeInputValid(address, bytes, dyld_page_size))
+        dyld::throwf("Darling dynamic-image TSD protection range rejected");
+    const vm_size_t pageBytes = dyld_page_round(bytes);
+    if (!DarlingTSDImage::protectionRangeEndValid(address, bytes, pageBytes))
+        dyld::throwf("Darling dynamic-image TSD protection range rejected");
+    auto isCode = [](uint32_t flags) {
+        const uint32_t type = flags & SECTION_TYPE;
+        return (flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) != 0 &&
+            type != S_ZEROFILL && type != S_GB_ZEROFILL && type != S_THREAD_LOCAL_ZEROFILL;
+    };
+    auto protect = [address, pageBytes, protection](bool writing) {
+        vm_prot_t requested = writing ? VM_PROT_READ | VM_PROT_WRITE : protection;
+        return vm_protect(mach_task_self(), address, pageBytes, false, requested) == KERN_SUCCESS;
+    };
+    auto flush = [](uint8_t* start, size_t length) {
+        __builtin___clear_cache(reinterpret_cast<char*>(start), reinterpret_cast<char*>(start + length));
+    };
+    DarlingTSDImage::Result result = DarlingTSDImage::rewrite<macho_segment_command, macho_section>(
+        segment, commandBytes, reinterpret_cast<uint8_t*>(address), bytes, slot,
+        (protection & PROT_READ) != 0, isCode, protect, flush);
+    if (result != DarlingTSDImage::Success)
+        dyld::throwf("Darling dynamic-image TSD rewrite failed (category %u)", static_cast<unsigned>(result));
+}
 #endif
 
 uint32_t ImageLoaderMachO::fgSymbolTableBinarySearchs = 0;
@@ -2728,6 +2761,20 @@ void ImageLoaderMachO::mapSegments(int fd, uint64_t offsetInFat, uint64_t lenInF
 						mmapErr, requestedLoadAddress, (uintptr_t)size, segName(i), getPath());
 			}
 		}
+#if defined(DARLING) && (defined(__aarch64__) || defined(__arm64__))
+        if (size > 0) {
+            const macho_segment_command* command = segLoadCommand(i);
+            const uintptr_t headerAddress = reinterpret_cast<uintptr_t>(fMachOData);
+            const uintptr_t commandAddress = reinterpret_cast<uintptr_t>(command);
+            const macho_header* header = reinterpret_cast<const macho_header*>(fMachOData);
+            if (commandAddress < headerAddress || commandAddress - headerAddress < sizeof(macho_header) ||
+                commandAddress - headerAddress - sizeof(macho_header) > header->sizeofcmds)
+                dyld::throwf("Darling dynamic-image TSD metadata rejected");
+            size_t available = header->sizeofcmds - (commandAddress - headerAddress - sizeof(macho_header));
+            darlingRewriteMappedTSD(command, available, requestedLoadAddress, size, protection);
+        }
+#endif
+
 		// update stats
 		++ImageLoader::fgTotalSegmentsMapped;
 		ImageLoader::fgTotalBytesMapped += size;
