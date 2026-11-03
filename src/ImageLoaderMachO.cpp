@@ -59,6 +59,7 @@ extern "C" void __simple_kprintf(const char* format, ...);
 #endif
 
 #include "ImageLoaderMachO.h"
+#include "DarlingImportDiagnostics.h"
 #include "ImageLoaderMachOCompressed.h"
 #if SUPPORT_CLASSIC_MACHO
 #include "ImageLoaderMachOClassic.h"
@@ -1953,8 +1954,10 @@ const char* ImageLoaderMachO::libPath(unsigned int index) const
 
 void __attribute__((noreturn)) ImageLoaderMachO::throwSymbolNotFound(const LinkContext& context, const char* symbol, 
 																	const char* referencedFrom, const char* fromVersMismatch,
-																	const char* expectedIn)
+																	const char* expectedIn, bool diagnosticImport, const ImageLoader* diagnosticRequestor)
 {
+    if (diagnosticImport)
+        darlingRecordMissingImport(context, diagnosticRequestor ? diagnosticRequestor : this, symbol);
 	// record values for possible use by CrashReporter or Finder
 	(*context.setErrorStrings)(DYLD_EXIT_REASON_SYMBOL_MISSING, referencedFrom, expectedIn, symbol);
 	dyld::throwf("Symbol not found: %s\n  Referenced from: %s%s\n  Expected in: %s\n",

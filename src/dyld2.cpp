@@ -123,6 +123,7 @@ extern "C" int __fork();
 #include "dyld2.h"
 #include "ImageLoader.h"
 #include "ImageLoaderMachO.h"
+#include <darling-boundary-diagnostics.h>
 #include "dyldLibSystemInterface.h"
 #include "dyld_cache_format.h"
 #include "dyld_process_info_internal.h"
@@ -6811,6 +6812,8 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 			break;
 	}
 #endif
+    if (gLinkContext.allowEnvVarsPrint)
+        darling_boundary_emit(darling_boundary_endpoint(envp), DARLING_DIAG_READY);
 	if ( sEnv.DYLD_PRINT_OPTS )
 		printOptions(argv);
 	if ( sEnv.DYLD_PRINT_ENV ) 

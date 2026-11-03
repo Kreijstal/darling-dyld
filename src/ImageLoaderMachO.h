@@ -239,7 +239,8 @@ protected:
 			void		UnmapSegments();
 			void		__attribute__((noreturn)) throwSymbolNotFound(const LinkContext& context, const char* symbol, 
 																	const char* referencedFrom, const char* fromVersMismatch,
-																	const char* expectedIn);
+																	const char* expectedIn, bool diagnosticImport = true,
+																	const ImageLoader* diagnosticRequestor = nullptr);
 			void		doImageInit(const LinkContext& context);
 			void		doModInitFunctions(const LinkContext& context);
 			void		setupLazyPointerHandler(const LinkContext& context);
