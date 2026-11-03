@@ -53,6 +53,7 @@
 #endif
 
 #include "ImageLoaderMachOClassic.h"
+#include "DarlingImportDiagnostics.h"
 
 // in dyldStartup.s
 extern "C" void stub_binding_helper_i386_old();
@@ -1037,9 +1038,11 @@ uintptr_t ImageLoaderMachOClassic::resolveUndefined(const LinkContext& context, 
 		if ( (undefinedSymbol->n_desc & N_WEAK_REF) != 0 ) {
 			// definition can't be found anywhere
 			// if reference is weak_import, then it is ok, just return 0
+            if ((undefinedSymbol->n_type & N_TYPE) == N_UNDF)
+                darlingRecordMissingImport(context, this, symbolName);
 			return 0;
 		}
-		throwSymbolNotFound(context, symbolName, this->getPath(), "", "flat namespace");
+		throwSymbolNotFound(context, symbolName, this->getPath(), "", "flat namespace", (undefinedSymbol->n_type & N_TYPE) == N_UNDF);
 	}
 	else {
 		// symbol requires searching images with coalesced symbols (not done during prebinding)
@@ -1084,12 +1087,14 @@ uintptr_t ImageLoaderMachOClassic::resolveUndefined(const LinkContext& context, 
 			if ( context.flatExportFinder(symbolName, &sym, foundIn) )
 				return (*foundIn)->getExportedSymbolAddress(sym, context, this);
 			
-			throwSymbolNotFound(context, symbolName, this->getPath(), "", "dynamic lookup");
+			throwSymbolNotFound(context, symbolName, this->getPath(), "", "dynamic lookup", (undefinedSymbol->n_type & N_TYPE) == N_UNDF);
 		}
 		else if ( ord <= libraryCount() ) {
 			target = libImage(ord-1);
 			if ( target == NULL ) {
 				// if target library not loaded and reference is weak or library is weak return 0
+				if ((undefinedSymbol->n_type & N_TYPE) == N_UNDF)
+					darlingRecordMissingImport(context, this, symbolName);
 				return 0;
 			}
 		}
@@ -1100,6 +1105,8 @@ uintptr_t ImageLoaderMachOClassic::resolveUndefined(const LinkContext& context, 
 		
 		if ( target == NULL ) {
 			//dyld::log("resolveUndefined(%s) in %s\n", symbolName, this->getPath());
+            if ((undefinedSymbol->n_type & N_TYPE) == N_UNDF)
+                darlingRecordMissingImport(context, this, symbolName);
 			throw "symbol not found";
 		}
 
@@ -1114,11 +1121,13 @@ uintptr_t ImageLoaderMachOClassic::resolveUndefined(const LinkContext& context, 
 		}
 		else if ( (undefinedSymbol->n_desc & N_WEAK_REF) != 0 ) {
 			// if definition not found and reference is weak return 0
+            if ((undefinedSymbol->n_type & N_TYPE) == N_UNDF)
+                darlingRecordMissingImport(context, this, symbolName);
 			return 0;
 		}
 		
 		// nowhere to be found
-		throwSymbolNotFound(context, symbolName, this->getPath(), "", target->getPath());
+		throwSymbolNotFound(context, symbolName, this->getPath(), "", target->getPath(), (undefinedSymbol->n_type & N_TYPE) == N_UNDF);
 	}
 }
 

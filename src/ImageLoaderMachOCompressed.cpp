@@ -42,6 +42,7 @@
 
 #include "dyld2.h"
 #include "ImageLoaderMachOCompressed.h"
+#include "DarlingImportDiagnostics.h"
 #include "Closure.h"
 #include "Array.h"
 
@@ -642,11 +643,13 @@ uintptr_t ImageLoaderMachOCompressed::resolveFlat(const LinkContext& context, co
 			return (*foundIn)->getExportedSymbolAddress(sym, context, this, runResolver);
 	}
 	if ( weak_import ) {
+        darlingRecordMissingImport(context, this, symbolName);
 		// definition can't be found anywhere, ok because it is weak, just return 0
 		return 0;
 	}
 #if defined(DARLING) && TARGET_OS_OSX
 	if ( context.iOSMissingAsWeak ) {
+        darlingRecordMissingImport(context, this, symbolName);
 		dyld::log("dyld: %s: %s is not in any image; using NULL\n", this->getShortName(), symbolName);
 		return 0;
 	}
@@ -746,10 +749,11 @@ uintptr_t ImageLoaderMachOCompressed::resolveWeak(const LinkContext& context, co
 			return (*foundIn)->getExportedSymbolAddress(sym, context, this, runResolver);
 	}
 	if ( weak_import ) {
+        darlingRecordMissingImport(context, this, symbolName);
 		// definition can't be found anywhere, ok because it is weak, just return 0
 		return 0;
 	}
-	throwSymbolNotFound(context, symbolName, this->getPath(), "", "weak");
+	throwSymbolNotFound(context, symbolName, this->getPath(), "", "weak", weak_import);
 }
 
 
@@ -763,11 +767,13 @@ uintptr_t ImageLoaderMachOCompressed::resolveTwolevel(const LinkContext& context
 		return address;
 
 	if ( weak_import ) {
+        darlingRecordMissingImport(context, requestorImage, symbolName);
 		// definition can't be found anywhere, ok because it is weak, just return 0
 		return 0;
 	}
 #if defined(DARLING) && TARGET_OS_OSX
 	if ( context.iOSMissingAsWeak ) {
+        darlingRecordMissingImport(context, requestorImage, symbolName);
 		dyld::log("dyld: %s: %s is not in %s; using NULL\n", this->getShortName(), symbolName, definedInImage->getShortName());
 		return 0;
 	}
@@ -790,7 +796,7 @@ uintptr_t ImageLoaderMachOCompressed::resolveTwolevel(const LinkContext& context
 		strcpy(versMismatch, msg);
 		::free((void*)msg);
 	}
-	throwSymbolNotFound(context, symbolName, this->getPath(), versMismatch, definedInImage->getPath());
+	throwSymbolNotFound(context, symbolName, this->getPath(), versMismatch, definedInImage->getPath(), true, requestorImage);
 }
 
 
@@ -838,6 +844,7 @@ uintptr_t ImageLoaderMachOCompressed::resolve(const LinkContext& context, const 
 				libraryOrdinal, libraryCount(), symbolName, this->getPath());
 		}
 		if ( *targetImage == NULL ) {
+            darlingRecordMissingImport(context, this, symbolName);
 #if defined(DARLING) && TARGET_OS_OSX
 			if ( weak_import || context.iOSMissingAsWeak ) {
 #else
