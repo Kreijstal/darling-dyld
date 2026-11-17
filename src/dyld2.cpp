@@ -100,9 +100,6 @@
 		AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING = (1 << 6),
 	};
 	extern "C" int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t* output_flags);
-#ifdef DARLING
-    int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t* output_flags) { *output_flags = 0x3F; return 0; }
-#endif
 #else
 	#include <libamfi.h>
 #endif
@@ -201,6 +198,138 @@ extern "C" {
 extern "C" const macho_header __dso_handle;
 
 extern bool gEnableSharedCacheDataConst;
+
+#ifdef DARLING
+#include <darling/emulation/common/dc_image_snapshot.h>
+#include <darling/emulation/linux_premigration/ext/for-sysconfig.h>
+
+// What Darling's code signing configuration (held by darlingserver, see
+// `dserver_system_config_t`) asks of this process. It is worked out once,
+// when dyld starts. With the default configuration everything stays false
+// and dyld behaves as if there were no code signing at all.
+static struct {
+	// map images from a sealed snapshot of their file
+	bool snapshotImages;
+	// make the read-only segments of images immutable
+	bool sealImages;
+} sDarlingCodeSigning;
+
+// Whether the process's entitlements set `key` to true. The entitlements
+// come from csops(CS_OPS_ENTITLEMENTS_BLOB): an 8-byte blob header (magic and
+// big-endian length) followed by an XML property list.
+static bool darlingHasTrueEntitlement(const char* key)
+{
+	// a sane upper bound; darlingserver reads no larger signatures either
+	const uint32_t maxLength = 16 * 1024 * 1024;
+	const size_t headerSize = 8;
+	uint8_t header[headerSize] = {};
+
+	// Without entitlements the call succeeds and leaves the buffer as it is
+	// (a zero length); otherwise the buffer is too small and it reports the
+	// length in the header.
+	if ( csops(0, CS_OPS_ENTITLEMENTS_BLOB, header, sizeof(header)) == 0 || errno != ERANGE )
+		return false;
+
+	uint32_t length = OSReadBigInt32(header, 4);
+	if ( length <= headerSize || length > maxLength )
+		return false;
+
+	char* blob = (char*)malloc(length + 1);
+	if ( blob == NULL )
+		return false;
+
+	bool result = false;
+	if ( csops(0, CS_OPS_ENTITLEMENTS_BLOB, blob, length) == 0 ) {
+		blob[length] = '\0';
+
+		const char* plist = blob + headerSize;
+		const size_t plistLength = strnlen(plist, length - headerSize);
+		const size_t keyLength = strlen(key);
+
+		// look for <key>KEY</key> followed by <true/>
+		for (size_t i = 0; i + 5 + keyLength + 6 <= plistLength; ++i) {
+			if ( strncmp(&plist[i], "<key>", 5) != 0 || strncmp(&plist[i + 5], key, keyLength) != 0
+				|| strncmp(&plist[i + 5 + keyLength], "</key>", 6) != 0 )
+				continue;
+
+			const char* value = &plist[i + 5 + keyLength + 6];
+			while ( *value == ' ' || *value == '\t' || *value == '\n' || *value == '\r' )
+				++value;
+			result = (strncmp(value, "<true/>", 7) == 0) || (strncmp(value, "<true />", 8) == 0);
+			break;
+		}
+	}
+
+	free(blob);
+	return result;
+}
+
+// Darling's stand-in for AMFI's dyld policy.
+//
+// By default (CodeSigningPolicy "off" or "warn", SealImages off) every DYLD_*
+// variable, @path and fallback path is allowed, whatever the program's code
+// signature says. macOS ignores DYLD_* variables for programs that use the
+// hardened runtime (CS_RUNTIME) unless they carry the get-task-allow or the
+// allow-dyld-environment-variables entitlement; Darling does the same only
+// when the policy is "enforce".
+//
+// SealImages applies only to hardened programs without get-task-allow, so
+// that programs built for debugging stay debuggable.
+int amfi_check_dyld_policy_self(uint64_t input_flags, uint64_t* output_flags)
+{
+	const uint64_t allowEverything =
+		AMFI_DYLD_OUTPUT_ALLOW_AT_PATH |
+		AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
+		AMFI_DYLD_OUTPUT_ALLOW_CUSTOM_SHARED_CACHE |
+		AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS |
+		AMFI_DYLD_OUTPUT_ALLOW_PRINT_VARS |
+		AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
+
+	(void)input_flags;
+	*output_flags = allowEverything;
+
+	dserver_system_config_t config;
+	if ( __darling_get_system_config(&config) != 0 )
+		return 0;
+
+	const bool enforce = (config.code_signing_policy == dserver_code_signing_policy_enforce);
+	if ( !enforce && !config.seal_images )
+		return 0;
+
+	uint32_t flags = 0;
+	if ( csops(0, CS_OPS_STATUS, &flags, sizeof(flags)) != 0 )
+		return 0;
+
+	const bool hardened = (flags & CS_RUNTIME) && !(flags & CS_GET_TASK_ALLOW);
+
+#if __i386__
+	// Linux supports mseal() for 64-bit processes only, so 32-bit images
+	// cannot be sealed.
+	sDarlingCodeSigning.sealImages = false;
+#else
+	sDarlingCodeSigning.sealImages = hardened && config.seal_images;
+#endif
+	// Verify and map the same bytes: under "enforce" a signature decides
+	// whether an image may be loaded, and a sealed image must be what its
+	// file was when it was loaded.
+	sDarlingCodeSigning.snapshotImages = enforce || sDarlingCodeSigning.sealImages;
+
+	if ( enforce && hardened && !darlingHasTrueEntitlement("com.apple.security.cs.allow-dyld-environment-variables") ) {
+		*output_flags = AMFI_DYLD_OUTPUT_ALLOW_AT_PATH |
+			AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS |
+			AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
+	}
+
+	return 0;
+}
+
+namespace dyld {
+	bool darlingSealImages()
+	{
+		return sDarlingCodeSigning.sealImages;
+	}
+}
+#endif // DARLING
 
 
 //
@@ -2682,6 +2811,19 @@ ImageLoader* getIndexedImage(unsigned int index)
 	return NULL;
 }
 
+// The loaded image whose path or install name is exactly `path`, or NULL.
+ImageLoader* findLoadedImageByInstallPath(const char* path)
+{
+	for (ImageLoader* image : sAllImages) {
+		if ( strcmp(path, image->getPath()) == 0 )
+			return image;
+		const char* installPath = image->getInstallPath();
+		if ( (installPath != NULL) && (strcmp(path, installPath) == 0) )
+			return image;
+	}
+	return NULL;
+}
+
 ImageLoader* findImageByMachHeader(const struct mach_header* target)
 {
 	return findMappedRange((uintptr_t)target);
@@ -3382,6 +3524,52 @@ static bool isSimulatorBinary(const uint8_t* firstPages, const char* path)
 }
 #endif
 
+#ifdef DARLING
+// A sealed copy of an image file (see DC_F_SNAPSHOT_IMAGE), made only when
+// the code signing configuration asks for it. Reading, verifying and mapping
+// the copy ensures the bytes whose signature was checked are the bytes that
+// get mapped, even if the file changes in the meantime. The caller keeps its
+// own descriptor; only the copy's descriptor is owned here.
+class DarlingImageSnapshot {
+public:
+	DarlingImageSnapshot(int source, const struct stat& stat_buf) : _fd(-1)
+	{
+		if ( !sDarlingCodeSigning.snapshotImages )
+			return;
+
+		int snapshot = fcntl(source, DC_F_SNAPSHOT_IMAGE, 0);
+		if ( snapshot < 0 )
+			throwf("cannot snapshot image: errno=%d", errno);
+
+		// the rest of loading still uses the stat data of the file itself
+		struct stat snapshotStat;
+		if ( (fstat(snapshot, &snapshotStat) != 0) || (snapshotStat.st_size != stat_buf.st_size) ) {
+			close(snapshot);
+			throw "file changed while it was being loaded";
+		}
+
+		_fd = snapshot;
+	}
+
+	~DarlingImageSnapshot()
+	{
+		if ( _fd >= 0 )
+			close(_fd);
+	}
+
+	DarlingImageSnapshot(const DarlingImageSnapshot&) = delete;
+	DarlingImageSnapshot& operator=(const DarlingImageSnapshot&) = delete;
+
+	int descriptor(int original) const
+	{
+		return (_fd >= 0) ? _fd : original;
+	}
+
+private:
+	int _fd;
+};
+#endif
+
 
 // map in file and instantiate an ImageLoader
 static ImageLoader* loadPhase6(int fd, const struct stat& stat_buf, const char* path, const LoadContext& context)
@@ -3391,8 +3579,13 @@ static ImageLoader* loadPhase6(int fd, const struct stat& stat_buf, const char* 
 	uint64_t fileLength = stat_buf.st_size;
 
 	// validate it is a file (not directory)
-	if ( (stat_buf.st_mode & S_IFMT) != S_IFREG ) 
+	if ( (stat_buf.st_mode & S_IFMT) != S_IFREG )
 		throw "not a file";
+
+#ifdef DARLING
+	DarlingImageSnapshot snapshot(fd, stat_buf);
+	fd = snapshot.descriptor(fd);
+#endif
 
 	uint8_t firstPages[MAX_MACH_O_HEADER_AND_LOAD_COMMANDS_SIZE];
 	bool shortPage = false;
@@ -3892,18 +4085,6 @@ static ImageLoader* loadPhase3(const char* path, const char* orgPath, const Load
 		// substitute @rpath with LD_LIBRARY_PATH
 		if ( sEnv.LD_LIBRARY_PATH != NULL ) {
 			image = loadPhase2(trailingPath, orgPath, context, NULL, sEnv.LD_LIBRARY_PATH, cacheIndex, exceptions);
-			if ( image != NULL )
-				return image;
-		}
-
-		// Fallback for system Swift runtime libraries in /usr/lib/swift (macOS 10.14.4+)
-		const char* swiftLeaf = strrchr(trailingPath, '/');
-		swiftLeaf = swiftLeaf ? swiftLeaf + 1 : trailingPath;
-		if ( strncmp(swiftLeaf, "libswift", 8) == 0 ) {
-			char swiftPath[PATH_MAX];
-			strcpy(swiftPath, "/usr/lib/swift/");
-			strlcat(swiftPath, swiftLeaf, sizeof(swiftPath));
-			image = loadPhase4(swiftPath, orgPath, context, cacheIndex, exceptions);
 			if ( image != NULL )
 				return image;
 		}
@@ -4412,13 +4593,6 @@ void setErrorMessage(const char* message)
 	strlcpy(error_string, message, sizeof(error_string));
 }
 
-#ifdef DARLING_DEBUG
-extern "C" void __simple_kprintf(const char* format, ...);
-#define DYLD_LOG(...) __simple_kprintf(__VA_ARGS__)
-#else
-#define DYLD_LOG(...) ((void)0)
-#endif
-
 const char* getErrorMessage()
 {
 	return error_string;
@@ -4426,7 +4600,6 @@ const char* getErrorMessage()
 
 void halt(const char* message)
 {
-	DYLD_LOG("DYLD HALT: %s\n", message ? message : "(null)");
 	if ( sSharedCacheLoadInfo.errorMessage != nullptr ) {
 		// <rdar://problem/45957449> if dyld fails with a missing dylib and there is no shared cache, display the shared cache load error message
 		dyld::log("dyld: dyld cache load error: %s\n", sSharedCacheLoadInfo.errorMessage);
@@ -6549,18 +6722,19 @@ static ClosureMode getPlatformDefaultClosureMode() {
 // Returns address of main() in target program which __dyld_start jumps to
 //
 uintptr_t
-__attribute__((no_stack_protector))
 _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide, 
 		int argc, const char* argv[], const char* envp[], const char* apple[], 
 		uintptr_t* startGlue)
 {
-	DYLD_LOG("dyld _main started! argc=%d argv[0]=%s\n", argc, argv[0] ? argv[0] : "(null)");
 	if (dyld3::kdebug_trace_dyld_enabled(DBG_DYLD_TIMING_LAUNCH_EXECUTABLE)) {
 		launchTraceID = dyld3::kdebug_trace_dyld_duration_start(DBG_DYLD_TIMING_LAUNCH_EXECUTABLE, (uint64_t)mainExecutableMH, 0, 0);
 	}
 
 	//Check and see if there are any kernel flags
 	dyld3::BootArgs::setFlags(hexToUInt64(_simple_getenv(apple, "dyld_flags"), nullptr));
+#if defined(DARLING) && defined(__arm64__)
+	dyld3::gDarlingRseqCpuOffset = _simple_getenv(apple, "darling_rseq_cpu_offset");
+#endif
 
 #if __has_feature(ptrauth_calls)
 	// Check and see if kernel disabled JOP pointer signing (which lets us load plain arm64 binaries)
@@ -6714,9 +6888,7 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 	}
 #endif
 
-    DYLD_LOG("dyld: before configureProcessRestrictions\n");
     configureProcessRestrictions(mainExecutableMH, envp);
-    DYLD_LOG("dyld: after configureProcessRestrictions\n");
 
 	// Check if we should force dyld3.  Note we have to do this outside of the regular env parsing due to AMFI
 	if ( dyld3::internalInstall() ) {
@@ -6776,11 +6948,8 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 	else
 #endif
 	{
-		DYLD_LOG("dyld: checkEnvironmentVariables start\n");
 		checkEnvironmentVariables(envp);
-		DYLD_LOG("dyld: defaultUninitializedFallbackPaths start\n");
 		defaultUninitializedFallbackPaths(envp);
-		DYLD_LOG("dyld: defaultUninitializedFallbackPaths done\n");
 	}
 #if TARGET_OS_OSX
 	switch (gProcessInfo->platform) {
@@ -7187,10 +7356,8 @@ reloadAllImages:
 
 
 		CRSetCrashLogMessage(sLoadingCrashMessage);
-		DYLD_LOG("dyld: instantiateFromLoadedImage start\n");
 		// instantiate ImageLoader for main executable
 		sMainExecutable = instantiateFromLoadedImage(mainExecutableMH, mainExecutableSlide, sExecPath);
-		DYLD_LOG("dyld: instantiateFromLoadedImage done\n");
 		gLinkContext.mainExecutable = sMainExecutable;
 		gLinkContext.mainExecutableCodeSigned = hasCodeSignatureLoadCommand(mainExecutableMH);
 
@@ -7320,9 +7487,7 @@ reloadAllImages:
 			sMainExecutable->rebase(gLinkContext, -mainExecutableSlide);
 		}
 #endif
-		DYLD_LOG("dyld: link start\n");
 		link(sMainExecutable, sEnv.DYLD_BIND_AT_LAUNCH, true, ImageLoader::RPathChain(NULL, NULL), -1);
-		DYLD_LOG("dyld: link done\n");
 		sMainExecutable->setNeverUnloadRecursive();
 		if ( sMainExecutable->forceFlat() ) {
 			gLinkContext.bindFlat = true;
@@ -7397,12 +7562,10 @@ reloadAllImages:
 		ImageLoader::applyInterposingToDyldCache(gLinkContext);
 
 		// Bind and notify for the main executable now that interposing has been registered
-		DYLD_LOG("dyld: before recursiveBind\n");
 		uint64_t bindMainExecutableStartTime = mach_absolute_time();
 		sMainExecutable->recursiveBindWithAccounting(gLinkContext, sEnv.DYLD_BIND_AT_LAUNCH, true);
 		uint64_t bindMainExecutableEndTime = mach_absolute_time();
 		ImageLoaderMachO::fgTotalBindTime += bindMainExecutableEndTime - bindMainExecutableStartTime;
-		DYLD_LOG("dyld: after recursiveBind\n");
 		gLinkContext.notifyBatch(dyld_image_state_bound, false);
 
 		// Bind and notify for the inserted images now interposing has been registered
@@ -7420,7 +7583,6 @@ reloadAllImages:
 		sMainExecutable->recursiveMakeDataReadOnly(gLinkContext);
 
 		CRSetCrashLogMessage("dyld: launch, running initializers");
-		DYLD_LOG("dyld: before initializeMainExecutable\n");
 	#if SUPPORT_OLD_CRT_INITIALIZATION
 		// Old way is to run initializers via a callback from crt1.o
 		if ( ! gRunInitializersOldWay ) 
@@ -7429,7 +7591,6 @@ reloadAllImages:
 		// run all initializers
 		initializeMainExecutable(); 
 	#endif
-		DYLD_LOG("dyld: after initializeMainExecutable\n");
 
 		// notify any montoring proccesses that this process is about to enter main()
 		notifyMonitoringDyldMain();
@@ -7450,21 +7611,17 @@ reloadAllImages:
 		{
 			// find entry point for main executable
 			result = (uintptr_t)sMainExecutable->getEntryFromLC_MAIN();
-			DYLD_LOG("dyld: getEntryFromLC_MAIN = %p\n", (void*)result);
 			if ( result != 0 ) {
 				// main executable uses LC_MAIN, we need to use helper in libdyld to call into main()
-				if ( (gLibSystemHelpers != NULL) && (gLibSystemHelpers->version >= 9) ) {
+				if ( (gLibSystemHelpers != NULL) && (gLibSystemHelpers->version >= 9) )
 					*startGlue = (uintptr_t)gLibSystemHelpers->startGlueToCallExit;
-					DYLD_LOG("dyld: startGlue = %p\n", (void*)*startGlue);
-				} else {
+				else
 					halt("libdyld.dylib support not present for LC_MAIN");
-				}
 			}
 			else {
 				// main executable uses LC_UNIXTHREAD, dyld needs to let "start" in program set up for main()
 				result = (uintptr_t)sMainExecutable->getEntryFromLC_UNIXTHREAD();
 				*startGlue = 0;
-				DYLD_LOG("dyld: getEntryFromLC_UNIXTHREAD = %p\n", (void*)result);
 			}
 		}
 	}
@@ -7494,7 +7651,6 @@ reloadAllImages:
 		*startGlue = (uintptr_t)gLibSystemHelpers->startGlueToCallExit;
 	}
 
-	DYLD_LOG("dyld: _main returning entry=%p startGlue=%p!\n", (void*)result, (void*)(startGlue ? *startGlue : 0));
 	return result;
 }
 

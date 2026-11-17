@@ -54,6 +54,8 @@
 #include "dyld2.h"
 #include "dyldLibSystemInterface.h"
 #include "DyldSharedCache.h"
+#include "dyld_objc_queries.h"
+#include "objc-shared-cache.h"
 #include "MachOFile.h"
 
 #undef _POSIX_C_SOURCE
@@ -147,7 +149,9 @@ static int sLastErrorNo;
 #ifdef DARLING
 extern "C" int mach_driver_get_dyld_fd(void);
 extern "C" void* elfcalls_get_pointer(void);
+#if __arm64__
 extern "C" size_t elfcalls_get_size(void);
+#endif
 extern "C" void mach_driver_set_dyld_fd(int fd);
 #if __arm64__
 // dyld's own (static) copy of libsystem_kernel's TSD lookup; see "__dyld_get_tsd_base" below.
@@ -235,6 +239,8 @@ static const struct dyld_func dyld_funcs[] = {
     {"__dyld_is_memory_immutable",						(void*)_dyld_is_memory_immutable },
     {"__dyld_objc_notify_register",						(void*)_dyld_objc_notify_register },
     {"__dyld_get_shared_cache_uuid",					(void*)_dyld_get_shared_cache_uuid },
+    {"__dyld_is_preoptimized_objc_image_loaded",		(void*)_dyld_is_preoptimized_objc_image_loaded },
+    {"__dyld_objc_class_count",							(void*)_dyld_objc_class_count },
     {"__dyld_get_shared_cache_range",					(void*)_dyld_get_shared_cache_range },
     {"__dyld_images_for_addresses",						(void*)_dyld_images_for_addresses },
     {"__dyld_register_for_image_loads",					(void*)_dyld_register_for_image_loads },
@@ -288,7 +294,9 @@ static const struct dyld_func dyld_funcs[] = {
 #endif
 #ifdef DARLING
 	{"__dyld_get_elfcalls", (void*)elfcalls_get_pointer },
+#if __arm64__
 	{"__dyld_get_elfcalls_size", (void*)elfcalls_get_size },
+#endif
 	// On arm64 the Darwin TSD base lives in a table inside libsystem_kernel, and dyld links its own static
 	// copy of that table. dyld registers the main thread there (_pthread_set_self_dyld); libsystem_kernel.dylib
 	// uses this to register the same base in its table.
@@ -2266,6 +2274,24 @@ const void* _dyld_get_shared_cache_range(size_t* length)
         return cache;
     }
 	return nullptr;
+}
+
+bool _dyld_is_preoptimized_objc_image_loaded(uint16_t imageIndex)
+{
+	const DyldSharedCache* cache = (DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+	if ( (cache == nullptr) || !dyld_cache_image_index_valid(cache->header.imagesCount, imageIndex) )
+		return false;
+	return dyld::findLoadedImageByInstallPath(cache->getIndexedImagePath(imageIndex)) != nullptr;
+}
+
+uint32_t _dyld_objc_class_count()
+{
+	const DyldSharedCache* cache = (DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+	if ( cache == nullptr )
+		return 0;
+	const objc_opt::objc_opt_t* objcOpt = cache->objcOpt();
+	const objc_opt::objc_clsopt_t* classes = (objcOpt != nullptr) ? objcOpt->clsopt() : nullptr;
+	return (classes != nullptr) ? classes->occupied : 0;
 }
 
 void _dyld_images_for_addresses(unsigned count, const void* addresses[], struct dyld_image_uuid_offset infos[])

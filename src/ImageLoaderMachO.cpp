@@ -40,19 +40,18 @@
 #include <mach-o/loader.h> 
 #include <mach-o/nlist.h> 
 #include <mach-o/dyld_images.h>
-
-#ifdef DARLING_DEBUG
-extern "C" void __simple_kprintf(const char* format, ...);
-#define DYLD_LOG(...) __simple_kprintf(__VA_ARGS__)
-#else
-#define DYLD_LOG(...) ((void)0)
-#endif
 #include <sys/sysctl.h>
 #include <sys/syscall.h>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSCacheControl.h>
 #include <stdint.h>
 #include <System/sys/codesign.h>
+
+#ifdef DARLING
+extern "C" {
+#include <darling/emulation/common/dc_mseal.h>
+}
+#endif
 
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
@@ -66,6 +65,9 @@ extern "C" void __simple_kprintf(const char* format, ...);
 #endif
 #include "Tracing.h"
 #include "dyld2.h"
+#if defined(DARLING) && (defined(__aarch64__) || defined(__arm64__))
+#include "DarlingDylibArena.h"
+#endif
 
 // <rdar://problem/8718137> use stack guard random value to add padding between dylibs
 extern "C" long __stack_chk_guard;
@@ -2341,13 +2343,11 @@ void ImageLoaderMachO::doModInitFunctions(const LinkContext& context)
 							}
 							if ( context.verboseInit )
 								dyld::log("dyld: calling initializer function %p in %s\n", func, this->getPath());
-							DYLD_LOG("dyld: calling init %p (idx %zu of %zu) in %s\n", (void*)func, j, count, this->getPath() ? this->getPath() : "(null)");
 							bool haveLibSystemHelpersBefore = (dyld::gLibSystemHelpers != NULL);
 							{
 								dyld3::ScopedTimer(DBG_DYLD_TIMING_STATIC_INITIALIZER, (uint64_t)fMachOData, (uint64_t)func, 0);
 								func(context.argc, context.argv, context.envp, context.apple, &context.programVars);
 							}
-							DYLD_LOG("dyld: init func returned!\n");
 							bool haveLibSystemHelpersAfter = (dyld::gLibSystemHelpers != NULL);
 							if ( !haveLibSystemHelpersBefore && haveLibSystemHelpersAfter ) {
 								// now safe to use malloc() and other calls in libSystem.dylib
@@ -2617,23 +2617,13 @@ uintptr_t ImageLoaderMachO::reserveAnAddressRange(size_t length, const ImageLoad
 	 * above 2^47 collides with ObjC's FAST_DATA_MASK (47 bits) and crashes
 	 * class_initialize. Sequentially hand out low-VA slots so all dylibs
 	 * remain within the addressable range. */
-	static uintptr_t fgDarlingNextDylibAddr = 0x300000000ULL; /* leave 0x100/0x200 ranges for exe + dyld (accessed via __atomic builtins / CAS) */
-	/* Claim the range by bumping the cursor BEFORE mapping. Reading the cursor, mapping,
-	 * and only then bumping lets two concurrent loads pick the same address; whether that
-	 * is caught depends on vm_allocate rejecting an occupied fixed range, which it does
-	 * not do today. Reserving first makes the allocator correct on its own. */
-	const uintptr_t stride = size + 0x100000; /* leave a 1 MiB gap */
-	for ( unsigned attempt = 0; attempt < 64; ++attempt ) {
-		uintptr_t claimed = __atomic_fetch_add(&fgDarlingNextDylibAddr, stride, __ATOMIC_RELAXED);
-		if ( claimed + stride >= 0x800000000000ULL )   /* 2^47: past here libobjc truncates pointers */
-			break;
-		addr = claimed;
-		kern_return_t r = vm_alloc(&addr, size, VM_FLAGS_FIXED | VM_MAKE_TAG(VM_MEMORY_DYLIB));
-		if ( r == KERN_SUCCESS )
-			return addr;
-		/* Occupied by something outside our arena (the ELF loader also maps here).
-		 * The cursor has already advanced, so the next attempt tries fresh space. */
-	}
+	static uintptr_t fgDarlingNextDylibAddr = DARLING_DYLIB_ARENA_BASE;
+	addr = darling_dylib_arena_claim(&fgDarlingNextDylibAddr, size, [](uintptr_t slot, size_t slotSize) -> int {
+		vm_address_t fixedAddr = slot;
+		return vm_alloc(&fixedAddr, slotSize, VM_FLAGS_FIXED | VM_MAKE_TAG(VM_MEMORY_DYLIB)) == KERN_SUCCESS;
+	});
+	if ( addr != 0 )
+		return addr;
 	/* fall back to ANYWHERE — at least the system might still be usable */
 	addr = 0;
 #endif
@@ -2743,33 +2733,6 @@ void ImageLoaderMachO::mapSegments(int fd, uint64_t offsetInFat, uint64_t lenInF
 					dyld::throwf("mmap() errno=%d at address=0x%08lX, size=0x%08lX segment=%s in Segment::map() mapping %s",
 						mmapErr, requestedLoadAddress, (uintptr_t)size, segName(i), getPath());
 			}
-#if defined(__aarch64__) || defined(__arm64__)
-			if ( (protection & PROT_EXEC) && loadAddress != MAP_FAILED && size > 0 ) {
-				if (mprotect(loadAddress, size, PROT_READ | PROT_WRITE) == 0) {
-					// The loader's own TLS slot holds the TSD base; [tp, #64] only for loaders that don't name one.
-					unsigned long slot = sys_thread_get_native_tsd_slot_offset();
-					if (slot < 16 || slot > 32760 || (slot & 7))
-						slot = 64;
-					uint32_t* insns = (uint32_t*) loadAddress;
-					size_t count = size / sizeof(uint32_t);
-					for (size_t k = 0; k < count; k++) {
-						if ((insns[k] & 0xFFFFFFE0U) == 0xD53BD060U) {
-							uint32_t rt = insns[k] & 0x1FU;
-							insns[k] = 0xD53BD040U | rt; // mrs Xt, TPIDR_EL0
-							if (k + 1 < count && ((insns[k+1] & 0xFFC00000U) == 0x92400000U) &&
-							    ((insns[k+1] & 0x1FU) == rt) && (((insns[k+1] >> 5) & 0x1FU) == rt)) {
-								insns[k+1] = 0xF9400000U | ((uint32_t)(slot / 8) << 10) | (rt << 5) | rt; // ldr Xt, [Xt, #slot]
-								k++;
-							}
-						}
-					}
-					if (mprotect(loadAddress, size, protection) != 0) {
-						dyld::throwf("mprotect() failed to restore execute permission: %s", strerror(errno));
-					}
-					__builtin___clear_cache((char*)loadAddress, (char*)loadAddress + size);
-				}
-			}
-#endif
 		}
 		// update stats
 		++ImageLoader::fgTotalSegmentsMapped;
@@ -2799,7 +2762,44 @@ void ImageLoaderMachO::mapSegments(int fd, uint64_t offsetInFat, uint64_t lenInF
 
 	// update slide to reflect load location			
 	this->setSlide(slide);
+
+#ifdef DARLING
+	if ( dyld::darlingSealImages() )
+		this->darlingSealSegments();
+#endif
 }
+
+#ifdef DARLING
+// Darling's SealImages setting: make the read-only code and __LINKEDIT of the
+// image immutable, so they can no longer be remapped, made writable or
+// unmapped. Segments that dyld itself still has to modify (text relocations)
+// are left alone.
+void ImageLoaderMachO::darlingSealSegments()
+{
+	static bool sSealingUnsupported = false;
+
+	for (unsigned int i = 0, e = segmentCount(); i < e && !sSealingUnsupported; ++i) {
+		if ( segUnaccessible(i) || segWriteable(i) || (segFileSize(i) == 0) )
+			continue;
+		if ( (strcmp(segName(i), "__TEXT") != 0) && (strcmp(segName(i), "__LINKEDIT") != 0) )
+			continue;
+		if ( segExecutable(i) && (segHasRebaseFixUps(i) || segHasBindFixUps(i)) )
+			continue;
+
+		// only the part that is mapped from the file
+		const int protection = PROT_READ | (segExecutable(i) ? PROT_EXEC : 0);
+		const int result = __darling_mseal_range((void*)segActualLoadAddress(i), dyld_page_round(segFileSize(i)), protection);
+		if ( result == -ENOSYS ) {
+			// the host kernel cannot seal memory (Linux before 6.10)
+			dyld::warn("cannot seal images: the host kernel does not support mseal()\n");
+			sSealingUnsupported = true;
+		}
+		else if ( result < 0 ) {
+			dyld::warn("cannot seal %s in %s: errno=%d\n", segName(i), getPath(), -result);
+		}
+	}
+}
+#endif
 
 void ImageLoaderMachO::mapSegments(const void* memoryImage, uint64_t imageLen, const LinkContext& context)
 {

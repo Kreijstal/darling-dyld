@@ -35,7 +35,6 @@
 #include <sys/syslog.h>
 #include <sys/sysctl.h>
 #include <sys/mman.h>
-#include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
@@ -46,6 +45,7 @@
 #include <TargetConditionals.h>
 
 #include "dyld_cache_format.h"
+#include "dyld_cache_ranges.h"
 #include "SharedCacheRuntime.h"
 #include "Loading.h"
 #include "BootArgs.h"
@@ -388,11 +388,9 @@ static void verboseSharedCacheMappingsToConsole(const shared_file_mapping_slide_
 }
 #endif
 
-static bool cacheRangeContains(uint64_t start, uint64_t length,
-                               uint64_t address, uint64_t size)
+static inline bool cacheRangeContains(uint64_t start, uint64_t length, uint64_t address, uint64_t size)
 {
-    return length <= UINT64_MAX - start && address >= start
-        && address - start <= length && size <= length - (address - start);
+    return dyld_cache_range_contains(start, length, address, size);
 }
 
 static bool preflightCacheFile(const SharedCacheOptions& options, SharedCacheLoadInfo* results, CacheInfo* info)
@@ -909,25 +907,52 @@ public:
 #endif
 
 #if defined(DARLING) && defined(__arm64__)
+// A macOS arm64 cache reads the Darwin thread-specific data base from
+// TPIDRRO_EL0, which a Linux process cannot set, and the CPU number from
+// TPIDR_EL0, which is the Linux thread pointer here. After a private mapping,
+// every such read in the cache's executable mappings is rewritten so that it
+// yields the base from the native TLS slot libsystem_kernel fills, or the CPU
+// number from the native rseq area (see dyld_tsd_rewrite.h for the veneers and
+// their fallbacks).
+//
+// The rewrite writes into the process's private copy of the cache only. Pages
+// are made writable (never writable and executable together) for the scan, the
+// instruction cache is invalidated for the changed range before execute
+// permission returns, and the veneers sit in a separate anonymous mapping that
+// becomes read-only executable once filled. The cache is not code-signed or
+// sealed by dyld, so nothing here fights those protections; every executable
+// mapping is read once, which costs startup time proportional to the cache.
+#include <libkern/OSCacheControl.h>
+#include "dyld_tsd_rewrite.h"
+
 extern "C" unsigned long sys_thread_get_native_tsd_slot_offset(void);
+
+const char* gDarlingRseqCpuOffset = nullptr;
 
 class DarlingTSDReadVeneers {
     uint32_t* memory = nullptr;
     size_t used = 0;
     unsigned long slot = 0;
+    bool cpuFromRseq = false;
+    long cpuOffset = 0;
     bool committed = false;
     static const size_t capacity = 1024 * 1024;
-    static bool branch(uintptr_t from, uintptr_t to, uint32_t& encoded) {
-        int64_t delta = (int64_t)to - (int64_t)from;
-        if ((delta & 3) || delta < -(1LL << 27) || delta >= (1LL << 27))
-            return false;
-        encoded = 0x14000000U | ((uint32_t)(delta >> 2) & 0x03FFFFFFU);
-        return true;
+
+    // Reserves `words` of veneer for the instruction at `original` and stores
+    // the branch to it; nullptr when no veneer can be placed or reached.
+    uint32_t* reserve(size_t words, uintptr_t original, uint32_t* entryBranch) {
+        uint32_t* code = (uint32_t*)((uintptr_t)memory + used);
+        if (!memory || used + 4 * words > capacity
+            || !dyld_tsd_branch(original, (uintptr_t)code, entryBranch))
+            return nullptr;
+        return code;
     }
 public:
-    DarlingTSDReadVeneers(uintptr_t cacheStart, unsigned long offset) : slot(offset) {
-        if (offset < 16 || offset > 32760 || (offset & 7) || cacheStart <= capacity)
+    DarlingTSDReadVeneers(uintptr_t cacheStart, unsigned long offset, bool rseqKnown, long rseqOffset)
+        : slot(offset), cpuFromRseq(rseqKnown && dyld_cpu_offset_loadable(rseqOffset)), cpuOffset(rseqOffset) {
+        if ((!dyld_tsd_slot_offset_valid(offset) && !cpuFromRseq) || cacheStart <= capacity)
             return;
+        // Just below the cache, where a branch from its text can reach (+-128 MiB).
         void* desired = (void*)(cacheStart - capacity);
         void* mapped = ::mmap(desired, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (mapped != desired) {
@@ -939,23 +964,28 @@ public:
     ~DarlingTSDReadVeneers() {
         if (memory && !committed) ::munmap(memory, capacity);
     }
+    // The instruction that replaces `mrs Xd, TPIDRRO_EL0` at `original`: a
+    // branch to a veneer when one can be placed and reached, else the trap.
     uint32_t translate(uint32_t reg, uintptr_t original) {
-        if (reg == 31) return 0xD503201FU; // MRS XZR has no observable result
-        uint32_t entryBranch, returnBranch;
-        if (!memory || used + 20 > capacity
-            || !branch(original, (uintptr_t)memory + used, entryBranch)
-            || !branch((uintptr_t)memory + used + 16, original + 4, returnBranch))
-            return 0x0000DA00U | reg;
-        uint32_t* code = (uint32_t*)((uintptr_t)memory + used);
-        code[0] = 0xD53BD040U | reg; // mrs Xd, TPIDR_EL0
-        code[1] = 0xF9400000U | ((uint32_t)(slot / 8) << 10) | (reg << 5) | reg;
-        code[2] = 0xB5000040U | reg; // cbnz Xd, +8 (preserves NZCV)
-        code[3] = 0x0000DA00U | reg; // uninitialized slot: existing TSD trap
-        code[4] = returnBranch;
-        used += 20;
+        if (reg == 31) return DYLD_A64_NOP; // MRS XZR has no observable result
+        uint32_t entryBranch;
+        uint32_t* code = dyld_tsd_slot_offset_valid(slot) ? reserve(DYLD_TSD_VENEER_WORDS, original, &entryBranch) : nullptr;
+        if (!code || !dyld_tsd_build_veneer(code, (uintptr_t)code, original + 4, reg, slot))
+            return DYLD_A64_UDF_TSD_TRAP | reg;
+        used += 4 * DYLD_TSD_VENEER_WORDS;
         return entryBranch;
     }
-    size_t count() const { return used / 20; }
+    // The instruction that replaces `mrs Xd, TPIDR_EL0` at `original`: a
+    // branch to a veneer that loads the CPU number, else CPU 0.
+    uint32_t translateCPUNumber(uint32_t reg, uintptr_t original) {
+        if (reg == 31) return DYLD_A64_NOP;
+        uint32_t entryBranch;
+        uint32_t* code = cpuFromRseq ? reserve(DYLD_CPU_VENEER_WORDS, original, &entryBranch) : nullptr;
+        if (!code || !dyld_cpu_build_veneer(code, (uintptr_t)code, original + 4, reg, cpuOffset))
+            return DYLD_A64_MOVZ_X | reg;
+        used += 4 * DYLD_CPU_VENEER_WORDS;
+        return entryBranch;
+    }
     bool finish() {
         if (memory) {
             sys_icache_invalidate(memory, used);
@@ -969,8 +999,11 @@ public:
 
 static bool translateDarlingCacheTSD(const CacheInfo& info, const char** errorMessage)
 {
+    long rseqCpuOffset = 0;
+    bool rseqCpuOffsetKnown = dyld_cpu_parse_rseq_offset(gDarlingRseqCpuOffset, &rseqCpuOffset);
     DarlingTSDReadVeneers veneers(info.mappings[0].sms_address,
-                                 sys_thread_get_native_tsd_slot_offset());
+                                 sys_thread_get_native_tsd_slot_offset(),
+                                 rseqCpuOffsetKnown, rseqCpuOffset);
     for (uint32_t i = 0; i < info.mappingsCount; ++i) {
         const auto& mapping = info.mappings[i];
         if (!(mapping.sms_init_prot & VM_PROT_EXECUTE))
@@ -985,15 +1018,13 @@ static bool translateDarlingCacheTSD(const CacheInfo& info, const char** errorMe
         uint32_t* end = instruction + size / sizeof(uint32_t);
         bool changed = false;
         for (; instruction != end; ++instruction) {
-            if ((*instruction & 0xFFFFFFE0U) != 0xD53BD060U)
-                continue;
-            const uint32_t reg = *instruction & 0x1FU;
-            const uint32_t cpuIndexShift = 0xD34CFC00U | (reg << 5) | reg;
-            // Darwin's allocator CPU-index read is not a TSD pointer read.
-            if ((instruction + 1 != end) && instruction[1] == cpuIndexShift)
-                *instruction = 0xAA1F03E0U | reg; // mov Xd, XZR
-            else
+            uint32_t reg;
+            if (dyld_tsd_is_tpidrro_read(*instruction, &reg))
                 *instruction = veneers.translate(reg, (uintptr_t)instruction);
+            else if (dyld_cpu_is_tpidr_read(*instruction, &reg))
+                *instruction = veneers.translateCPUNumber(reg, (uintptr_t)instruction);
+            else
+                continue;
             changed = true;
         }
         if (changed)
